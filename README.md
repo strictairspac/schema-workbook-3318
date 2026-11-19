@@ -6,7 +6,7 @@
 
 原先设计员在Excel里堆叠委托号、客户、检测项、方法与结果，再手工画表结构。痛点：依赖口径难确认、复合键容易漏判、拆表后无法证明无损。上游为委托单和已确认业务规则，本项目承接关系草案登记、函数依赖编辑、3NF合成、验证报告导出，下游为实验数据录入系统的数据库设计人员。
 
-核心实体：关系草案 Relation、函数依赖 Dependency、分解报告 Report。4业务页和独立登录页；管理员另有审计页。业务规则不执行为SQL，属性名是纯数据。
+核心实体：关系草案 Relation、函数依赖 Dependency、分解报告 Report、抽检样本 SampleBatch、取证包 EvidencePackage。6业务页和独立登录页；管理员另有审计页。业务规则不执行为SQL，属性名是纯数据。
 
 ## 快速启动
 
@@ -30,6 +30,19 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 另有 `NL-1117-B` 的循环依赖 A→B/B→A与独立属性C，候选键AC/BC；`NL-1117-C` 没有确认依赖，完整属性集作为唯一候选键，不凭空猜测业务规则。
 
+### 抽查：取证包
+
+10:10 operator打开「抽检样本」，样本 `S-1117-A` 有6行原始委托；10:15按草案 `NL-1117-A` 与行数上限3生成取证包；10:20结果为「装不下」——可推翻 `委托号→客户`（第1/2行）与 `检测项→方法`（第3/4行），两对原始行互不重叠，最少4行，上限3证明装不下；把上限调到4后重跑，得到4行最少取证包；10:25核对时发现第2行客户抄错，在样本页更正为 v2；旧包标记失效，但已发布包仍可按旧快照查证；10:30按 v2 重新生成并发布。
+
+取证包规则：
+
+1. 只对整批样本**确实能推翻**的函数依赖举证；没有被整批样本推翻的依赖单独列出，不虚构证据。
+2. 每条可推翻依赖在包内配一对原始行（决定项相同、被决定项不同），可直接复现。
+3. 行集合覆盖所有可推翻依赖，并**精确证明**为该样本下的最少行数；证明不了就不发布。
+4. 最少行数不超过页面上限才进入「待核对」并可发布；证明超限报「装不下」，不发布残缺包。
+5. 入队冻结草案规则指纹与样本版本；中断后续跑沿用原样本与规则，重试复用未出结果的任务，不重复入队。
+6. 核对时更正样本会生成新版本；草案规则或样本变化让待核对包失效，已发布的包仍保留旧快照按旧版查证。
+
 ## 算法说明
 
 Python真算，MySQL保存草案/依赖与结果，Redis传递任务，独立worker执行。
@@ -39,24 +52,25 @@ Python真算，MySQL保存草案/依赖与结果，Redis传递任务，独立wor
 3. 最小覆盖：RHS拆成单属性，去平凡依赖；逐一删除左侧多余属性、移除冗余依赖。
 4. 3NF合成：按最小覆盖左侧分组，删除被包含关系；若无关系含候选键，补入候选键关系。无依赖时保留全属性关系。
 5. 验证：精确生成F+在各分解关系上的投影，枚举局部候选键，逐非平凡投影依赖检查3NF；所有原始依赖须可由投影并集推出。tableau追赶法依据FD合并符号，出现全a符号行则无损，报告包含见证行、合并步骤与最终表。
+6. 取证包：逐条依赖枚举反例原始行对，把每条可推翻依赖化为“至少一对行落在集合内”的约束；先贪心给出上界，再按行数从小到大做精确分支搜索（每条依赖挑一对最少新增行的反例），首个可行即最少。搜索有节点预算，超出时如实标记“未证明”，既不冒充最少也不误报超限。
 
 复合、循环、空决定项、无依赖均支持。不在任何RHS中的属性强制进入候选键。输入入队时冻结快照，后续修改不会改变已有报告。结果JSON含SHA256，固定输入应有固定输出。失败态包括引用关系外属性、重复/空属性、属性超过10、依赖超过64、队列错误；页面可恢复并重新执行。
 
-这是小型关系模型设计辅助工具，FD由人工提供，不能从脏数据自动推断业务规则；不连接生产数据或自动执行DDL。精确投影在10属性内有界，仍可能随依赖复杂度增加耗时。单worker串行队列，不带生产任务重试/崩溃续跑。
+这是小型关系模型设计辅助工具，FD由人工提供，不能从脏数据自动推断业务规则；取证包只按人工确认的规则筛样本，不自动推断规则。不连接生产数据或自动执行DDL。精确投影在10属性内有界，仍可能随依赖复杂度增加耗时。取证包精确搜索同样有节点预算，超预算会报「未证明」而不是伪称最少；最多60行样本、60行上限。单worker串行队列；取证包支持重启续跑，分解报告仍为一次性任务。
 
 ## 工程结构
 
 |服务|技术|职责|
 |---|---|---|
-|frontend|原生HTML/CSS/JS + Nginx|4业务页、登录、共享业务表格与报告组件|
+|frontend|原生HTML/CSS/JS + Nginx|6业务页、登录、共享业务表格与报告组件|
 |backend|Python3.11/FastAPI/SQLAlchemy/PyJWT|校验、权限、审计、快照与导出|
-|worker|Python3.11|闭包、候选键、3NF与chase|
-|db|MySQL8.0|JSON属性与依赖、任务报告|
-|redis|Redis7|持久任务队列|
+|worker|Python3.11|闭包、候选键、3NF、chase与取证包最少行搜索|
+|db|MySQL8.0|JSON属性、依赖、样本版本、任务与取证包|
+|redis|Redis7|持久任务队列（分解队列与取证包队列）|
 
 目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`。每核心实体贯穿模型/schema/service/route/API/store/page。组件table/badge/frame复用，hooks/session/feedback和utils/forms/html共用；request_id/errors双后端中间件。
 
-枚举：角色admin/operator/viewer、任务queued/running/completed/failed；前后端定义位于 `backend/src/constants/enums.py` 和 `frontend/src/constants/enums.js`，security/reports、frame/badge消费；worker持久化状态。
+枚举：角色admin/operator/viewer、任务queued/running/completed/failed、取证包queued/running/review/published/infeasible/invalid/failed；前后端定义位于 `backend/src/constants/enums.py` 和 `frontend/src/constants/enums.js`，security/reports/packages、frame/badge消费；worker持久化状态。
 
 环境变量见.env.example：COMPOSE_PROJECT_NAME、FRONTEND_PORT/BACKEND_PORT/DB_PORT、DB_PASSWORD、JWT_SECRET、SEED_DEMO。默认密码仅本地演示，JWT8小时。seed按自然键只补缺失关系及初始依赖，不覆盖用户修改。schema由SQLAlchemy metadata.create_all初始化，无在线迁移引擎。
 
